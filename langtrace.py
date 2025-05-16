@@ -29,11 +29,14 @@ def retriever(query: str):
     return results
 
 @traceable(name="ChatPromptTemplate", run_type="prompt")
-def chat_prompt_template(system_message, question):
-    return [
-        {"role": "system", "content": system_message},
-        {"role": "user", "content": question},
-    ]
+def chat_prompt_template(system_message, question=None, tool_outputs=None):
+    messages = [{"role": "system", "content": system_message}]
+    if question:
+        messages.append({"role": "user", "content": question})
+    if tool_outputs:
+        tool_context = "\nTool outputs:\n" + "\n".join([f"{tool}: {output}" for tool, output in tool_outputs.items()])
+        messages.append({"role": "system", "content": tool_context})
+    return messages
 
 @traceable(run_type="llm")
 def call_llm(messages):
@@ -51,7 +54,7 @@ def parse_tool_output(tool_output):
 @traceable(name="RunnableMap")
 def decide_and_call_tool(question, tool_list):
     prompt = f"Given the question: '{question}', and these tools: {tool_list}, which tool(s) should be used? Respond with a comma-separated list of tool names, or a JSON list if you prefer."
-    messages = chat_prompt_template(prompt, question)
+    messages = chat_prompt_template(prompt)  # No need to pass question again
     llm_response = chat_openai(messages)
     # Try to parse as JSON list first
     if hasattr(llm_response, 'choices'):
@@ -128,10 +131,15 @@ def orchestrator_agent(question, tool_outputs=None):
     allowed_agents = ', '.join([agent['name'] for agent in AGENTS])
     base_prompt = get_orchestrator_prompt(tool_descriptions, agent_descriptions, allowed_agents)
     plan = decide_and_call_tool(question, [tool['name'] for tool in TOOLS])
-    tool_output = execute_tool(plan, question) if plan else None
+    # Handle both single tool name and list of tool names
+    tool_output = None
+    if isinstance(plan, list):
+        tool_output = {tool_name: execute_tool(tool_name, question) for tool_name in plan}
+    elif isinstance(plan, str):
+        tool_output = execute_tool(plan, question)
     parsed_plan = parse_tool_output(plan)
     system_message = base_prompt + f"\n\nQuestion: {question}"
-    messages = chat_prompt_template(system_message, question)
+    messages = chat_prompt_template(system_message, question, tool_outputs)  # Include tool outputs in context
     llm_response = chat_openai(messages)
     parsed_llm = agent_output_parser(llm_response)
     return {
@@ -162,14 +170,30 @@ def runnable_agent(case_dict):
             "orchestrator_result": orchestrator_result,
             "tool_outputs": dict(context["tool_outputs"]),
         })
+        parsed_plan = orchestrator_result.get("parsed_plan", None)
+        plan = orchestrator_result.get("plan", None)
+        plan_tools = []
+        if isinstance(plan, list):
+            plan_tools = plan
+        elif isinstance(plan, str):
+            plan_tools = [plan]
+        for tool_name in plan_tools:
+            if tool_name and tool_name not in context["tool_outputs"] and tool_name not in allowed_agents and tool_name != "done":
+                context["tool_outputs"][tool_name] = execute_tool(tool_name, question)
         routing_decision = orchestrator_result.get("routing_decision", [])
         normalized = [a.lower().strip() for a in routing_decision]
         if all(agent in allowed_agents for agent in normalized) or normalized == ["done"]:
             break
+        # routing_decision can be a list of tool names
         for tool_name in routing_decision:
             if tool_name in context["tool_outputs"]:
                 continue
-            context["tool_outputs"][tool_name] = execute_tool(tool_name, question)
+            if isinstance(tool_name, list):
+                for t in tool_name:
+                    if t not in context["tool_outputs"]:
+                        context["tool_outputs"][t] = execute_tool(t, question)
+            else:
+                context["tool_outputs"][tool_name] = execute_tool(tool_name, question)
         steps += 1
     return {
         "trajectory": trajectory,
