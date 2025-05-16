@@ -1,0 +1,150 @@
+# Writing the YAML product spec file for LangGraph into the project directory
+spec_content = """version: "1.0"
+
+graph:
+  name: "SupplyChainWorkflow"
+  entry: DocumentLoader
+  capture_chain_of_thought: true   # record C-of-T across all LLM calls
+
+nodes:
+  - id: DocumentLoader
+    type: loader
+    description: "Ingests incoming case documents (PDFs, emails, spreadsheets)"
+    tool: DocumentLoaderTool
+
+  - id: GraphRouter
+    type: router
+    description: "Classifies the case and routes to the appropriate agents"
+    prompt: |
+      You are the router agent. Given the case documents, classify and decide which agents to run. Provide both your internal reasoning (chain_of_thought) and your routing decision.
+      Let’s think step by step:
+      - Review document types and content
+      - Determine if general doc review is always needed
+      - Determine if regulatory/sustainability review is needed
+      - Determine if sourcing/logistics handoff is needed
+      Respond with JSON:
+      {
+        "chain_of_thought": ["..."],
+        "decision": {"run_agentA": true, "run_agentB": <boolean>, "run_agentC": <boolean>},
+        "user_summary": "I recommend running AgentA always, AgentB only if regs needed, AgentC only if sourcing needed."
+      }
+    output_schema:
+      chain_of_thought: list[string]
+      decision:
+        run_agentA: boolean
+        run_agentB: boolean
+        run_agentC: boolean
+      user_summary: string
+
+  - id: AgentA
+    type: agent
+    name: "GeneralDocReviewAgent"
+    description: "Performs general document compliance checks and handles declaration ambiguities"
+    tools:
+      - VectorRetriever:StyleGuide
+      - LLMChain
+      - SlackTool
+      - EmailTool
+    prompt: |
+      You are a document auditor. Let’s think step by step:
+      1) Compare the case file against our style guide: required sections, naming conventions, attachments.
+      2) Scan for incomplete or ambiguous declaration fields (e.g., missing unit, fuzzy quantity).
+      After your internal reasoning, provide:
+        - chain_of_thought: an array of your reasoning steps
+        - decision: { "ambiguities_found": [...], "escalate": true/false }
+        - user_summary: a concise, user-friendly explanation of findings and next steps
+    output_schema:
+      chain_of_thought: list[string]
+      decision:
+        ambiguities_found: list[string]
+        escalate: boolean
+      escalation_message: string
+      user_summary: string
+
+  - id: AgentB
+    type: agent
+    name: "RegAndSustAgent"
+    description: "Performs combined regulatory compliance and sustainability evaluation"
+    tools:
+      - HTSLookupTool
+      - VectorRetriever:Regulations
+      - ESGScoringAPI
+      - LLMChain
+    prompt: |
+      You are a compliance & sustainability analyst. Let’s think step by step:
+      1) For each HS code, fetch tariff rates & check CFR compliance.
+      2) Estimate the carbon footprint using the ESG API.
+      After your reasoning, provide:
+        - chain_of_thought: your step-by-step analysis
+        - decision: { "reg_flags": [...], "sustainability_score": <number>, "escalate": true/false }
+        - user_summary: a clear, non-technical summary of any risks and recommendations
+    output_schema:
+      chain_of_thought: list[string]
+      decision:
+        reg_flags: list[object]
+        sustainability_score: integer
+        escalate: boolean
+      user_summary: string
+
+  - id: AgentC
+    type: agent
+    name: "SourcingLogisticsAgent"
+    description: "Handles sourcing and logistics handoff tasks"
+    tools:
+      - SQLTool:ApprovedVendorDB
+      - HTTPTool:ProcurementAPI
+      - CalendarTool
+      - TMSPushTool
+      - LLMChain
+    prompt: |
+      You are a sourcing/logistics coordinator. Let’s think step by step:
+      1) Query the approved-vendor DB and evaluate best-fit options.
+      2) Generate an RFQ payload/email with specs, qty, and target date.
+      3) Schedule a calendar follow-up in 48 hours.
+      4) Push order details to the TMS.
+      After your reasoning, provide:
+        - chain_of_thought: reasoning steps
+        - decision: { "vendor_id": <id>, "rfq_sent": true, "follow_up_scheduled": true }
+        - tms_payload: {...}
+        - user_summary: a brief update on next logistic steps and owner
+    output_schema:
+      chain_of_thought: list[string]
+      decision:
+        vendor_id: integer
+        rfq_sent: boolean
+        follow_up_scheduled: boolean
+      tms_payload: object
+      user_summary: string
+
+  - id: ErrorHandler
+    type: handler
+    description: "Catches errors and escalates to human-in-loop if needed"
+    tools:
+      - SlackTool
+      - EmailTool
+
+edges:
+  - from: DocumentLoader
+    to: GraphRouter
+
+  - from: GraphRouter
+    to: AgentA
+    condition: always
+
+  - from: GraphRouter
+    to: AgentB
+    condition: decision.run_agentB
+
+  - from: GraphRouter
+    to: AgentC
+    condition: decision.run_agentC
+
+  - on_error: ErrorHandler
+    connect_from: all
+"""
+
+# Write to file
+with open('/mnt/data/supply_chain_spec.yaml', 'w') as f:
+    f.write(spec_content)
+
+# Provide download link
